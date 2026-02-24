@@ -1,0 +1,14 @@
+#!/usr/bin/env bash
+set -e
+source config.sh
+
+mkdir -p ${CNV_OUTDIR}/{depth,windows,normalized,calls}
+
+while read SAMPLE; do
+    bash 01_depth_calculation.sh ${SAMPLE}
+    bash 02_window_average.sh ${SAMPLE}
+    bash 03_normalize.sh ${SAMPLE}
+    bash 04_call_cnv.sh ${SAMPLE}
+done < ../${SAMPLES}
+
+echo "CNV calling completed."
