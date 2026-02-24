@@ -5,7 +5,7 @@ mkdir -p ${PHYLO_OUTDIR}
 PHYLIP=$1
 BASENAME=$(basename ${PHYLIP} .phy)
 
-${IQTREE} \
+iqtree2 \
   -s ${PHYLIP} \
   -m "GTR+G" -mrate CAT \
   -bb 1000 \
