@@ -1,0 +1,8 @@
+#!/bin/bash
+# PHYLOGENY SETTINGS
+PHYLO_OUTDIR="results/phylogeny"
+IQTREE="iqtree2"
+BOOTSTRAPS=1000
+MODEL="GTR+G"   # IQ-TREE equivalent of GTRCAT
+THREADS=40
+MEM=300G
