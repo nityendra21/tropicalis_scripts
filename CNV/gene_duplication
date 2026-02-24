@@ -1,0 +1,245 @@
+library(tidyverse)
+library(data.table)
+library(pheatmap)
+library(reshape2)
+library(zoo)
+
+# List pattern - updated for normalized depth files
+file_list <- list.files(path = "normalized/", pattern = "*.normalized.tsv$", full.names = TRUE)
+
+# Extract names
+file_names <- sub("\\.normalized.tsv$", "", basename(file_list))
+
+# Transform data - modified for your normalized depth format
+calculate_log2 <- function(file_path, file_name) {
+  # Read the TSV file with header
+  data <- fread(file_path, header = TRUE, sep = '\t', nThread = 8)
+  data <- data.frame(data)
+
+  # Your data already has windows (frameStart/frameEnd), so we use it directly
+  # Select relevant columns: scaffold, frameStart, frameEnd, depth
+  data <- data %>%
+    select(scaffold, frameStart, frameEnd, depth)
+
+  # Average read depth of whole genome
+  mean_depth <- mean(data$depth, na.rm = TRUE)
+
+  # Calculate log2 ratio (normalized to genome average)
+  data$log2 <- log2(data$depth / mean_depth)
+
+  # Also keep the raw ratio for easier interpretation
+  data$ratio <- data$depth / mean_depth
+
+  # Convert to mb
+  data$pos_mb <- data$frameStart / 1e6
+
+  # Create a mapping vector for scaffold names
+  scaffold_map <- c(
+    "CP047869.1" = "Chromosome 1",
+    "CP047870.1" = "Chromosome 2",
+    "CP047871.1" = "Chromosome 3",
+    "CP047872.1" = "Chromosome 4",
+    "CP047873.1" = "Chromosome 5",
+    "CP047874.1" = "Chromosome 6",
+    "CP047875.1" = "Chromosome R"
+  )
+
+  # Rename the scaffolds
+  data$scaffold <- scaffold_map[data$scaffold]
+
+  # Add a column for the file name
+  data$isolate <- file_name
+
+  return(data)
+}
+
+# Apply function, import all data to list
+depth_all <- mapply(calculate_log2, file_list, file_names, SIMPLIFY = FALSE)
+
+# Convert dataframe
+cnv_df <- as.data.frame(bind_rows(depth_all))
+
+# Create a list of genes
+regions <- list(
+  ERG11 = list(chr = "Chromosome 5", start = 1094026, end = 1095612),
+  ERG3 = list(chr = "Chromosome 2", start = 2193270, end = 2194448),
+  FKS1 = list(chr = "Chromosome 2", start = 1795485, end = 1799326),
+  UPC2 = list(chr = "Chromosome R", start = 743024, end = 745372),
+  MRR1 = list(chr = "Chromosome 4", start = 1828972, end = 1832424),
+  TAC1 = list(chr = "Chromosome 5", start = 1026139, end = 1028970),
+  MDR1 = list(chr = "Chromosome 4", start = 1464708, end = 1466366),
+  CDR2 = list(chr = "Chromosome 4", start = 971292, end = 975788),
+  HMG1 = list(chr = "Chromosome 2", start = 2523050, end = 2526181),
+  STB5 = list(chr = "Chromosome 2", start = 2330879, end = 2332798)
+)
+
+# Function to calculate mean log2 and ratio for each isolate
+calculate_gene_cnv <- function(data, region) {
+  data %>%
+    filter(scaffold == region$chr) %>%
+    filter(frameStart >= region$start & frameEnd <= region$end) %>%
+    group_by(isolate) %>%
+    summarize(
+      mean_log2 = mean(log2, na.rm = TRUE),
+      mean_ratio = mean(ratio, na.rm = TRUE),
+      .groups = 'drop'
+    )
+}
+
+# Apply the function to get CNV for all genes
+gene_list <- names(regions)
+cnv_results <- list()
+
+for (gene in gene_list) {
+  result <- calculate_gene_cnv(cnv_df, regions[[gene]])
+  cnv_results[[gene]] <- result %>%
+    rename(!!paste0(gene, "_log2") := mean_log2,
+           !!paste0(gene, "_ratio") := mean_ratio)
+}
+
+# Combine results into a single dataframe
+genes_cnv <- cnv_results[[1]]
+for (i in 2:length(cnv_results)) {
+  genes_cnv <- genes_cnv %>%
+    left_join(cnv_results[[i]], by = "isolate")
+}
+
+# Add resistance and susceptibility information for clustering
+resistant_isolates <- c("P1_12", "P1_26", "P1_27", "P1_48", "P1_56", "P1_60", "P1_61",
+                        "P1_66", "P1_67", "P1_68", "P1_69", "P1_70", "P1_71", "P1_74",
+                        "P1_75", "P1_87", "P1_90", "P1_93", "P1_112", "P1_114", "P1_115",
+                        "P1_118", "P1_119", "P1_121", "P1_122", "P1_123", "P1_124",
+                        "P1_125", "P1_132", "P1_134")
+
+genes_cnv <- genes_cnv %>%
+  mutate(type = ifelse(isolate %in% resistant_isolates, "Resistant", "Susceptible")) %>%
+  select(isolate, type, everything())
+
+genes_cnv_classified <- genes_cnv %>%
+  mutate(across(ends_with("_ratio"),
+                ~ case_when(
+                  . >= 2 ~ "duplication",
+                  . <= 0.5 ~ "deletion",
+                  TRUE ~ "normal"
+                ),
+                .names = "{.col}_status"))
+
+genes_cnv_final <- genes_cnv_classified %>%
+  select(1,2,4,23,6,24,8,25,10,26,12,27,14,28,16,29,18,30,20,31,22,32)
+
+# Calculating mean coverage depth and sd of each group (FLU-R and FLU-S)
+genes_summary <- genes_cnv %>%
+  group_by(type) %>%
+  summarise(across(ends_with("_ratio"),
+                   list(mean = ~ mean(.x, na.rm = TRUE),
+                        sd = ~ sd(.x, na.rm = TRUE)),
+                   .names = "{.col}_{.fn}")) %>%
+  pivot_longer(
+    cols = -type,
+    names_to = c("gene", ".value"),
+    names_pattern = "(.*)_ratio_(.*)"
+  ) %>%
+  mutate(summary = sprintf("%.2f ± %.2f", mean, sd)) %>%
+  select(type, gene, summary)
+
+# write_xlsx(genes_summary, "duplication_stats.xlsx")
+
+# Extract just the ratio columns for analysis
+ratio_cols <- grep("_ratio$", names(genes_cnv), value = TRUE)
+genes_cnv_ratios <- genes_cnv %>%
+  select(isolate, type, all_of(ratio_cols))
+
+# Rename columns to remove _ratio suffix for cleaner display
+names(genes_cnv_ratios) <- gsub("_ratio$", "", names(genes_cnv_ratios))
+
+# Identify gene duplications (copy number >= 1.5, which is log2 >= 0.585)
+# Using ratio > 1.4 as threshold for duplication
+duplication_summary <- genes_cnv_ratios %>%
+  mutate(across(where(is.numeric), ~ ifelse(. >= 1.4, "Duplicated",
+                                            ifelse(. <= 0.6, "Deleted", "Normal")),
+                .names = "{.col}_status"))
+
+# Count duplications per gene
+duplication_counts <- duplication_summary %>%
+  select(ends_with("_status")) %>%
+  summarise(across(everything(), ~ sum(. == "Duplicated")))
+
+print("=== Gene Duplication Summary ===")
+print(t(duplication_counts))
+
+# Find which isolates have duplications
+genes_for_duplication <- gsub("_ratio$", "", ratio_cols)
+for (gene in genes_for_duplication) {
+  duplicated_isolates <- genes_cnv_ratios %>%
+    filter(get(gene) >= 1.4) %>%
+    pull(isolate)
+
+  if (length(duplicated_isolates) > 0) {
+    cat(sprintf("\n%s duplications found in: %s\n",
+                gene, paste(duplicated_isolates, collapse = ", ")))
+  }
+}
+
+# Create a copy number call matrix (rounded to nearest 0.5)
+transformed_cnv <- genes_cnv_ratios %>%
+  mutate(across(where(is.numeric), ~ case_when(
+    . < 0.25 ~ 0,
+    . >= 0.25 & . < 0.75 ~ 0.5,
+    . >= 0.75 & . < 1.25 ~ 1,
+    . >= 1.25 & . < 1.75 ~ 1.5,
+    . >= 1.75 & . < 2.25 ~ 2,
+    . >= 2.25 & . < 2.75 ~ 2.5,
+    . >= 2.75 & . < 3.25 ~ 3,
+    . >= 3.25 & . < 3.75 ~ 3.5,
+    . >= 3.75 & . < 4.25 ~ 4,
+    . >= 4.25 & . < 4.75 ~ 4.5,
+    . >= 4.75 & . < 5.25 ~ 5,
+    TRUE ~ .
+  )))
+
+# Sort by isolate number
+transformed_cnv <- transformed_cnv %>%
+  mutate(isolate_num = as.numeric(gsub("\\D", "", isolate))) %>%
+  arrange(isolate_num) %>%
+  select(-isolate_num)
+
+# Write output files
+write.csv(genes_cnv, "gene_cnv_detailed.csv", row.names = FALSE)
+write.csv(transformed_cnv, "gene_cnv_calls.csv", row.names = FALSE)
+write.csv(genes_cnv_ratios, "gene_cnv_ratios.csv", row.names = FALSE)
+
+# Create heatmap of copy number calls
+heatmap_data <- transformed_cnv %>%
+  column_to_rownames("isolate") %>%
+  select(-type) %>%
+  as.matrix()
+
+# Annotation for heatmap
+annotation_row <- transformed_cnv %>%
+  select(isolate, type) %>%
+  column_to_rownames("isolate")
+
+# Generate heatmap
+pheatmap(heatmap_data,
+         cluster_rows = TRUE,
+         cluster_cols = TRUE,
+         annotation_row = annotation_row,
+         color = colorRampPalette(c("blue", "white", "red"))(50),
+         breaks = seq(0, 5, length.out = 51),
+         main = "Gene Copy Number Variations",
+         filename = "cnv_heatmap.pdf",
+         width = 10,
+         height = 12)
+
+print("Analysis complete! Check output files for results.")
+
+
+
+
+
+
+
+
+
+
+g
